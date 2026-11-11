@@ -39,14 +39,6 @@ PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
 GROQ_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_URL = "https://api.groq.com/openai/v1"
-GROQ_FALLBACKS = [
-    m.strip()
-    for m in os.getenv("GROQ_FALLBACK_MODELS", "llama-3.3-70b-versatile").split(",")
-    if m.strip()
-]
-GROQ_MAX_TOKENS = int(
-    os.getenv("GROQ_MAX_TOKENS", "500")
-)  # voice replies are short; this also counts against the per-minute token limit
 MAX_TOOL_ROUNDS = 6
 
 app = FastAPI(title="Snapdeal Virtual KAM")
@@ -304,19 +296,6 @@ async def run_agent(state: dict, lang: str) -> tuple[str, list]:
     return "एक मिनट, मैं थोड़ा और देखता हूँ।", tool_events
 
 
-def _retry_after(r) -> float:
-    """Seconds Groq asks us to wait after a 429 (header first, then the 'try again in 5.3s' text)."""
-    try:
-        return float(r.headers.get("retry-after"))
-    except (TypeError, ValueError):
-        pass
-    m = re.search(r"try again in ([\d.]+)(ms|s|m)", r.text)
-    if not m:
-        return 5.0
-    v = float(m.group(1))
-    return v / 1000 if m.group(2) == "ms" else v * 60 if m.group(2) == "m" else v
-
-
 def _lower_types(x):
     if isinstance(x, dict):
         return {
@@ -353,48 +332,34 @@ async def run_agent_oa(state: dict, text: str, lang: str) -> tuple[str, list]:
     async with httpx.AsyncClient(timeout=30) as client:
         for _ in range(MAX_TOOL_ROUNDS):
             r = None
-            for model in [
-                GROQ_MODEL
-            ] + GROQ_FALLBACKS:  # primary model first, then backup models (separate rate-limit buckets)
-                for attempt in range(2):
-                    try:
-                        r = await client.post(
-                            GROQ_URL + "/chat/completions",
-                            headers={"Authorization": f"Bearer {GROQ_KEY}"},
-                            json={
-                                "model": model,
-                                "messages": [system] + hist,
-                                "tools": oa_tools(),
-                                "temperature": 0.6,
-                                "max_tokens": GROQ_MAX_TOKENS,
-                                **(
-                                    {"reasoning_effort": "low"}
-                                    if "gpt-oss" in model
-                                    else {}
-                                ),
-                            },
-                        )
-                    except httpx.TimeoutException:
-                        r = None
-                        continue
-                    if r.status_code == 429:
-                        wait = _retry_after(r)
-                        print(f"Groq 429 on {model}, Groq says wait {wait:.1f}s")
-                        if (
-                            wait <= 8 and attempt == 0
-                        ):  # short wait: stay on this model and retry once
-                            await asyncio.sleep(wait + 0.3)
-                            continue
-                        break  # long wait: try the next model
-                    if r.status_code in RETRY_STATUS or (
-                        r.status_code == 400 and "tool_use_failed" in r.text
-                    ):
-                        print(f"Groq {r.status_code} on {model}, retry {attempt + 1}")
-                        await asyncio.sleep(0.4 * (attempt + 1))
-                        continue
-                    break
-                if r is not None and r.status_code == 200:
-                    break
+            for attempt in range(3):
+                try:
+                    r = await client.post(
+                        GROQ_URL + "/chat/completions",
+                        headers={"Authorization": f"Bearer {GROQ_KEY}"},
+                        json={
+                            "model": GROQ_MODEL,
+                            "messages": [system] + hist,
+                            "tools": oa_tools(),
+                            "temperature": 0.6,
+                            "max_tokens": 1200,
+                            **(
+                                {"reasoning_effort": "low"}
+                                if "gpt-oss" in GROQ_MODEL
+                                else {}
+                            ),
+                        },
+                    )
+                except httpx.TimeoutException:
+                    r = None
+                    continue
+                if r.status_code in RETRY_STATUS or (
+                    r.status_code == 400 and "tool_use_failed" in r.text
+                ):
+                    print(f"Groq {r.status_code}, retry {attempt + 1}")
+                    await asyncio.sleep(0.4 * (attempt + 1))
+                    continue
+                break
             if r is None or r.status_code != 200:
                 raise RuntimeError(
                     f"Groq {getattr(r, 'status_code', 'timeout')}: {(r.text[:300] if r is not None else '')}"
